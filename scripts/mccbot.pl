@@ -1,253 +1,158 @@
 use Irssi;
+
 use lib 'modules';
 
-use URI::Escape;
-use URI::Find;
+use Protocol::WebSocket::Client;
+use IO::Socket;
+use IO::Select;
 
 use strict;
-
-our %global;
-our %msg_buffer;
-
-our @uris;
-our $finder = URI::Find->new(sub
-{
-  my($uri) = shift;
-  push @uris, $uri;  
-});
 
 sub clean_eval {
     return eval shift;
 }
 
-my $char   = '!';
-my $charre = quotemeta $char;
+my $irssi_config = '/home/acce/.mccrelay';
 
-my $commands = 'commands';
-my $irssi_config = '/home/acce/.mccbot';
+our %last_info;
 
-sub reply { $_{server}->command("msg $_{target} $_{nick}: $_") for @_ }
-sub say   { $_{server}->command("msg $_{target} $_") for @_ }
+our $s = IO::Socket::INET->new;
+our $select = IO::Select->new;
+
+our $webclient = Protocol::WebSocket::Client->new(url => 'ws://irc.mathcodingclub.com:8081/socket/index.php');
+
+my %soc_funcs = (
+    disconnect => sub {
+	if((not $s->connected ))
+	{
+	    Irssi::print "Already disconnected";
+	    say($last_info{'server'},$last_info{'target'}, "Already disconnected");
+	}
+else
+{
+    Irssi::print "Disconnecting";
+      $webclient->write("Relay offline!");
+      $webclient->disconnect;
+  
+      $s->shutdown(2);
+      $s->close;
+
+      $select->remove($s);
+      say($last_info{'server'},$last_info{'target'}, "Relay offline!"); 
+}
+    },
+    connect => sub {
+	if($s->connected)
+	{
+	    Irssi::print "Already connected";
+	    say($last_info{'server'},$last_info{'target'}, "Already connected");
+	}
+else
+{
+    Irssi::print "Connecting";
+      $s = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => 8081, Proto => 'tcp', Blocking => 0);
+      $select->add($s);
+
+      $webclient = Protocol::WebSocket::Client->new(url => 'ws://irc.mathcodingclub.com:8081/socket/index.php');
+
+$webclient->on(write => 
+	       sub {
+		   my $client = shift;
+		   my ($buf) = @_;
+		   
+		   syswrite $s, $buf;
+	       });
+
+$webclient->on(read => 
+	       sub {
+		   my $client = shift;
+		   my ($buf) = @_;
+
+		   Irssi::print "Message from web: " . $buf;
+		   if(%last_info)
+{
+   say($last_info{'server'},$last_info{'target'}, $buf); 
+
+}
+else
+{
+   Irssi::print "Need to get message from the channel first"; 
+   syswrite $s, "Relay not initialized from the irc side";
+}
+	       });
+
+
+      $webclient->connect;
+      $webclient->on(
+        connect => sub {
+          $webclient->write("Relay online!");
+          say($last_info{'server'},$last_info{'target'}, "Relay online!"); 
+          $webclient->write("!iambot"); 
+
+        }
+      );
+}
+    },
+    status => sub {
+     if($s->connected)
+     {
+       say($last_info{'server'},$last_info{'target'}, "Relay online, handles:" . $select->count()); 
+       $webclient->write("Relay online!");
+     }
+     else
+     {
+       say($last_info{'server'},$last_info{'target'}, "Relay offline, handles:" . $select->count()); 
+     }
+    }
+    
+    );
+
+
+
+sub reply { my ($server, $target, $nick, $msg) = @_; $server->command("msg $target $nick: $msg") }
+sub say   { my ($server, $target, $msg) = @_; $server->command("msg $target $msg") }
 sub reply_private   { $_{server}->command("msg $_{nick} $_") for @_ }
 sub match { $_{server}->masks_match("@_", $_{nick}, $_{address}) }
-
-sub load {
-          my ($command, $server, $nick, $target) = @_;
-    my $mtime =  (stat "$irssi_config/$commands/$command")[9];
-    if ($mtime) {
-        if ($mtime > $global{filecache}{$command}{mtime}) {
-            local $/ = undef;
-            open my $fh, "$irssi_config/$commands/$command"; # no die
-            $global{filecache}{$command} = {
-                mtime => $mtime,
-                code  => clean_eval join "\n", 
-                    'sub {',
-                        'local %_ = %{ +shift };',
-                        "#line 1 $command",
-                        readline($fh),
-                    '}'
-            };
-            Irssi::print $@ ? $@ : "Loaded $command";
-        }
-        return $global{filecache}{$command}{code};
-    }
-
-    Irssi::print "Could not load $command";
-    delete $global{filecache}{$command} if exists $global{filecache}{$command};
-    return undef;
-}
-
-sub try_rest
-{
-    my ($server, $command, $msg, $nick, $target) = @_;
-
-    my $rest = "http://rest.mathcodingclub.com";
-
-    my $method = "GET";
-    my $data = "";
-
-    if($msg =~ s/^://)
-    {
-      $method = uc($command);
-      if(not $method =~ m/POST|GET|OPTIONS|DELETE|PUT/)
-      {
-	$server->command("msg $target $nick: Invalid HTTP method!");
-        return 0;
-      }
-      else
-      {
-        $command = "";
-
-
-        if($method eq "POST")
-        {
-          $msg =~ s/(\{.*?\})//;
-          my $d = $1;
-          if($d eq "")
-          {
-            $server->command("msg $target $nick: No post data given! Use wave brackets to enclose data, the brackets are included to the data (eg. !post:command pathparam {postdata})");
-            return 0;
-          }
-          else
-          {
-            $msg =~ s/^\s+|\s+$//g;
-            $data = "-d \'$d\'";
-          }
-        }
-      }
-    }
-
-    $command =~ s/^\s+|\s+$//g;
-    $msg =~ s/\"(.*?)\"/uri_escape($1)/ge;
-    my $path = $rest . "/" . $command;
-    if($msg ne "")
-    {
-     $path .= "/" . $msg;   
-   
-     $path =~ s/^\s+|\s+$//g;
-     $path =~ s/\s/\//g;
-     $path =~ s/\/$/\//g;
-
-    }
-
-
-    Irssi::print "method: " . $method . ", path: " . $path . ", data: " . $data;
-
-    my $gotinfo = `curl -s -X $method $data $path`;
-
-    if(index($gotinfo, "404 Page Not Found") != -1)
-    {
-      return 0; #command not found in rest either
-    }
-    else
-    {
-      my $code = eval join "\n",
-        'sub {',
-          'local %_ = %{ +shift @_ };',
-          'my @lines = split(/\n/, $gotinfo);',
-          'my $sender = \&say;',
-          'if(scalar @lines > 4)',
-          '{',
-          '$sender = \&reply_private;',
-          '',
-          '}',
-          'foreach(@lines)',
-          '{',
-            '$sender->($_);',
-          '}',
-        '}';
-
-      $target ||= $nick;
-      eval {
-        $code->( {
-            server => $server,
-            nick => $nick,
-            target => $target
-        });
-      };
-      return 1;
-    }
-
-}
-
-sub push_to_buffer
-{
-  my ($msg, $nick, $target) = @_;
-
-  if(not defined @{$msg_buffer{$target}})
-  {
-    @{$msg_buffer{$target}} = [];
-  }
-
-  if(scalar @{$msg_buffer{$target}} > 15)
-  {
-    shift @{$msg_buffer{$target}};
-  }
-  $msg =~ s/"/\\"/g;
-  push(@{$msg_buffer{$target}}, "{\"user\":\"$nick\",\"quote\":\"\\\"$msg\\\"\"}");
-}
-
-sub send_titles_for_url
-{
-  my ($server, $msg, $nick, $target) = @_;
-
-  $finder->find(\$msg);
-
-  foreach(@uris)
-  {
-    my $title = `curl -s $_`;
-    $title =~ s/.*?<title>(.*?)<\/title>.*?//;
-    if( $1 ne "")
-    {
-    $target ||= $nick;
-
-      $server->command("msg $target Title - $1");
-    }
-  }
-
-  @uris=();
-
-}
-
-our $last_msg = "";
 
 sub message {
     my ($server, $msg, $nick, $address, $target) = @_;
 
-    send_titles_for_url($server, $msg, $nick, $target);
+    $last_info{'server'} = $server;
+    $last_info{'target'} = $target;
+    $last_info{'msg'} = $msg;
+    $last_info{'nick'} = $nick;
+    $last_info{'address'} = $address;
 
-    if($last_msg eq "")
+    if($nick =~ m/Acce|Pekko/ && $msg =~ s/^%(connect|status|disconnect)\s*//)
     {
-      $last_msg = $msg;
+	my $command = $1;
 
-      if( ($nick ne "mccbot") && (not $last_msg =~ m/^$charre(\w+)(?:$| )/) && $target ne $nick)
-      {
-        push_to_buffer($last_msg, $nick, $target);
-      }
-      
-    }
-
-    return $last_msg = "" unless $msg =~ s/^$charre(\w+)\s*//;
-    my $command = $1;
- 
-    my $code = load($command);
-    if (not ref $code)
-    {
-        $last_msg = "";
-	my $rest_success = try_rest($server, $command, $msg, $nick, $target);
-	return $server->command("msg $target $nick: I don't know that command!") if not $rest_success;
+	$soc_funcs{$command}->();
+	
     }
     else
-    {    
-
-
-    $target ||= $nick;
-      eval {
-
-        $code->( {
-            command => "$char$command",
-            server  => $server,
-            msg     => $msg,
-            nick    => $nick, 
-            address => $address,
-            target  => $target
-        } );
-
-      };
+    {
+	$webclient->write("< " . $nick . " > " . $msg) unless not $s->connected;
     }
-    Irssi::print "$command by $nick${\ ($target ? qq/ in $target/ : '') } on " .
+
+    Irssi::print "message by $nick${\ ($target ? qq/ in $target/ : '') } on " .
                  "$server->{address}";
 
-    $_[1] = "\cO" . $_[1];
+}
 
-    Irssi::signal_emit($target ? 'message public' : 'message private', @_);
+sub check_socket {
 
-    Irssi::print $@ if $@;
-    Irssi::signal_stop;
-    $last_msg = "";
+    foreach my $socket ($select->can_read(0.5)) {
+	if (ref $socket eq 'IO::Socket::INET') {
+	    Irssi::print("reading shit");
+	    # read from websocket
+	    $socket->sysread(my $buf, 1000);
+	    Irssi::print("reading shit: " . $buf);
+	    $webclient->read($buf);
+	}
+    }
 }
 
 Irssi::signal_add_last 'message public' => \&message;
 Irssi::signal_add_last 'message private' => \&message;
-
-load '=init';
+Irssi::timeout_add(1000, 'check_socket', '');

@@ -35,10 +35,10 @@ servers = (
 chatnets = {
   IRCnet = {
     type = "IRC";
-    nick = "mccbot";
+    nick = "mccrelay";
     max_query_chans = "5";
     max_kicks = "4";
-    max_msgs = "5";
+    max_msgs = "15";
     max_whois = "4";
   };
   EFNet = { 
