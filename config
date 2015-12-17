@@ -101,9 +101,9 @@ chatnets = {
 channels = (
   { name = "#irssi"; chatnet = "ircnet"; autojoin = "No"; },
   { name = "silc"; chatnet = "silc"; autojoin = "No"; },
-  { name = "#mcctestign"; chatnet = "IRCnet"; autojoin = "yes"; },
+  { name = "#mcctestign"; chatnet = "IRCnet"; autojoin = "No"; },
   { name = "#smg-linkit"; chatnet = "IRCnet"; autojoin = "yes"; },
-  { name = "#sahfys"; chatnet = "IRCnet"; autojoin = "yes"; }
+  { name = "#sahfys"; chatnet = "IRCnet"; autojoin = "No"; }
 );
 
 aliases = {
